@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetAnalyzer - a web-based network analyzer for Ubuntu.
+9w2diNet Analyze - a web-based network analyzer for Ubuntu.
 
 Features
   * Live bandwidth per interface (upload / download rate + history chart)
@@ -631,7 +631,7 @@ INDEX_HTML = r'''<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NetAnalyzer</title>
+<title>9w2diNet Analyze</title>
 <style>
   :root{
     --bg:#0f1419; --panel:#171e26; --panel2:#1e2731; --line:#2a3542;
@@ -684,7 +684,7 @@ INDEX_HTML = r'''<!doctype html>
 </head>
 <body>
 <header>
-  <h1>Net<span>Analyzer</span></h1>
+  <h1>9w2di<span>Net Analyze</span></h1>
   <div class="meta"><span id="host">—</span><span id="uptime"></span><span id="cpu"></span><span id="mem"></span></div>
   <nav>
     <button class="active" data-tab="overview">Overview</button>
@@ -1067,7 +1067,7 @@ def main():
         except RuntimeError as exc:
             print(f"[!] {exc}")
 
-    print(f"[*] NetAnalyzer running on http://{args.host}:{args.port}")
+    print(f"[*] 9w2diNet Analyze running on http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
 
 
