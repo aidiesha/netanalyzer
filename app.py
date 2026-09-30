@@ -21,7 +21,7 @@ import time
 from datetime import datetime
 
 import psutil
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, request
 
 try:
     from scapy.all import AsyncSniffer, ARP, DNS, DNSQR, ICMP, IP, IPv6, TCP, UDP, conf
@@ -264,7 +264,7 @@ def interfaces_info():
 # --------------------------------------------------------------------------- #
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return Response(INDEX_HTML, mimetype="text/html")
 
 
 @app.route("/api/system")
@@ -389,6 +389,371 @@ def api_dns():
         return jsonify({"ok": True, "output": "\n".join(lines) or "No records"})
     except socket.gaierror as exc:
         return jsonify({"ok": False, "output": f"Lookup failed: {exc}"})
+
+
+# --------------------------------------------------------------------------- #
+# Web dashboard (built in, so no templates folder is needed)
+# --------------------------------------------------------------------------- #
+INDEX_HTML = r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetAnalyzer</title>
+<style>
+  :root{
+    --bg:#0f1419; --panel:#171e26; --panel2:#1e2731; --line:#2a3542;
+    --text:#e6edf3; --muted:#8b98a5; --accent:#3fb6a8; --accent2:#e3a13b;
+    --good:#4cc38a; --bad:#e5534b; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Ubuntu,sans-serif}
+  header{display:flex;align-items:center;gap:16px;padding:14px 20px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  header h1{font-size:18px;margin:0;letter-spacing:.3px}
+  header h1 span{color:var(--accent)}
+  .meta{color:var(--muted);font-size:13px;display:flex;gap:14px;flex-wrap:wrap}
+  nav{display:flex;gap:4px;margin-left:auto;flex-wrap:wrap}
+  nav button{background:transparent;border:1px solid transparent;color:var(--muted);padding:7px 14px;border-radius:6px;cursor:pointer;font:inherit}
+  nav button.active{background:var(--panel2);color:var(--text);border-color:var(--line)}
+  main{padding:20px;max-width:1400px;margin:0 auto}
+  .tab{display:none}.tab.active{display:block}
+  .grid{display:grid;gap:14px}
+  .g4{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+  .g2{grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+  .card h3{margin:0 0 10px;font-size:13px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);font-weight:600}
+  .stat{font-size:24px;font-weight:600;font-variant-numeric:tabular-nums}
+  .stat small{font-size:13px;color:var(--muted);font-weight:400}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  select,input{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px 10px;font:inherit}
+  input{min-width:220px}
+  .btn{background:var(--accent);color:#08201d;border:0;border-radius:6px;padding:8px 16px;font:inherit;font-weight:600;cursor:pointer}
+  .btn.sec{background:var(--panel2);color:var(--text);border:1px solid var(--line)}
+  .btn.stop{background:var(--bad);color:#fff}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{color:var(--muted);font-weight:600;position:sticky;top:0;background:var(--panel)}
+  td.mono,.mono{font-family:var(--mono);font-size:12.5px}
+  .scroll{max-height:460px;overflow:auto}
+  .pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600;background:var(--panel2);border:1px solid var(--line)}
+  .up{color:var(--good)} .down{color:var(--bad)}
+  .bar{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden;margin-top:3px}
+  .bar i{display:block;height:100%;background:var(--accent)}
+  .msg{padding:10px 12px;border-radius:6px;background:#3a2a12;color:#f3cf8f;border:1px solid #5c4119;margin-bottom:14px;display:none}
+  pre{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:12px;min-height:120px;overflow:auto;font-family:var(--mono);font-size:12.5px;margin:10px 0 0;white-space:pre-wrap}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block;background:var(--muted)}
+  .dot.on{background:var(--good);box-shadow:0 0 8px var(--good)}
+  .chartbox{position:relative;height:260px}
+  .ifsel{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+  .ifsel button{background:var(--panel2);border:1px solid var(--line);color:var(--muted);padding:4px 10px;border-radius:6px;cursor:pointer;font:inherit;font-size:12.5px}
+  .ifsel button.active{color:var(--text);border-color:var(--accent)}
+  @media (max-width:640px){main{padding:12px} nav{margin-left:0} input{min-width:0;flex:1}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Net<span>Analyzer</span></h1>
+  <div class="meta"><span id="host">—</span><span id="uptime"></span><span id="cpu"></span><span id="mem"></span></div>
+  <nav>
+    <button class="active" data-tab="overview">Overview</button>
+    <button data-tab="capture">Packet Capture</button>
+    <button data-tab="connections">Connections</button>
+    <button data-tab="tools">Tools</button>
+  </nav>
+</header>
+
+<main>
+  <!-- OVERVIEW -->
+  <section class="tab active" id="overview">
+    <div class="grid g4" id="totals"></div>
+    <div class="card" style="margin-top:14px">
+      <h3>Live bandwidth</h3>
+      <div class="ifsel" id="ifButtons"></div>
+      <div class="chartbox"><canvas id="bwChart"></canvas></div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h3>Interfaces</h3>
+      <div class="scroll"><table id="ifTable"><thead><tr>
+        <th>Interface</th><th>State</th><th>IPv4</th><th>MAC</th><th>Download</th><th>Upload</th>
+        <th>Total RX</th><th>Total TX</th><th>Errors</th><th>Drops</th></tr></thead><tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- CAPTURE -->
+  <section class="tab" id="capture">
+    <div class="msg" id="capMsg"></div>
+    <div class="card">
+      <div class="row">
+        <span class="dot" id="capDot"></span>
+        <select id="capIface"><option value="">All interfaces</option></select>
+        <input id="capFilter" placeholder='BPF filter, e.g. "tcp port 443" or "host 10.0.0.5"'>
+        <button class="btn" id="capStart">Start</button>
+        <button class="btn stop" id="capStop">Stop</button>
+        <button class="btn sec" id="capReset">Clear</button>
+      </div>
+    </div>
+    <div class="grid g4" style="margin-top:14px">
+      <div class="card"><h3>Packets</h3><div class="stat" id="cPackets">0</div></div>
+      <div class="card"><h3>Data</h3><div class="stat" id="cBytes">0 B</div></div>
+      <div class="card"><h3>Packets / sec</h3><div class="stat" id="cPps">0</div></div>
+      <div class="card"><h3>Throughput</h3><div class="stat" id="cBps">0 B/s</div></div>
+    </div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card"><h3>Protocols</h3><div class="chartbox"><canvas id="protoChart"></canvas></div></div>
+      <div class="card"><h3>Packet rate</h3><div class="chartbox"><canvas id="ppsChart"></canvas></div></div>
+      <div class="card"><h3>Top sources (bytes)</h3><div id="topSrc"></div></div>
+      <div class="card"><h3>Top destinations (bytes)</h3><div id="topDst"></div></div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h3>Top ports</h3>
+      <div class="row" id="topPorts"></div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h3>Live packets</h3>
+      <div class="scroll"><table id="pktTable"><thead><tr>
+        <th>Time</th><th>Source</th><th>Destination</th><th>Protocol</th><th>Length</th><th>Info</th></tr></thead><tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- CONNECTIONS -->
+  <section class="tab" id="connections">
+    <div class="msg" id="connMsg"></div>
+    <div class="card">
+      <div class="row" style="margin-bottom:10px">
+        <select id="connKind"><option value="inet">All</option><option value="tcp">TCP</option><option value="udp">UDP</option></select>
+        <input id="connSearch" placeholder="Search address, process, status…">
+        <span class="meta" id="connCount"></span>
+      </div>
+      <div class="scroll" style="max-height:620px"><table id="connTable"><thead><tr>
+        <th>Proto</th><th>Local address</th><th>Remote address</th><th>Status</th><th>PID</th><th>Process</th></tr></thead><tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- TOOLS -->
+  <section class="tab" id="tools">
+    <div class="grid g2">
+      <div class="card"><h3>Ping</h3>
+        <div class="row"><input id="pingHost" placeholder="8.8.8.8 or example.com"><button class="btn" id="pingBtn">Ping</button></div>
+        <pre id="pingOut"></pre></div>
+      <div class="card"><h3>DNS lookup</h3>
+        <div class="row"><input id="dnsHost" placeholder="example.com"><button class="btn" id="dnsBtn">Lookup</button></div>
+        <pre id="dnsOut"></pre></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function fmtBytes(b){const u=["B","KB","MB","GB","TB"];let i=0;while(b>=1024&&i<u.length-1){b/=1024;i++}return (i?b.toFixed(1):Math.round(b))+" "+u[i]}
+const fmtRate = b => fmtBytes(b)+"/s";
+function fmtDur(s){s=Math.floor(s);const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return (d?d+"d ":"")+h+"h "+m+"m"}
+async function api(url, body){
+  const opt = body!==undefined ? {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)} : {};
+  const r = await fetch(url, opt); return r.json();
+}
+
+// ---------- tabs ----------
+let activeTab = "overview";
+document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("nav button").forEach(x=>x.classList.toggle("active", x===b));
+  document.querySelectorAll(".tab").forEach(t=>t.classList.toggle("active", t.id===b.dataset.tab));
+  activeTab = b.dataset.tab; tick();
+});
+
+// ---------- charts ----------
+// Tiny dependency-free canvas charts (works fully offline).
+const PALETTE=["#3fb6a8","#e3a13b","#6c8cff","#e5534b","#b07cf0","#4cc38a","#d8699b","#58b0e0","#c9c95a","#8b98a5"];
+const C_MUTED="#8b98a5", C_GRID="#2a3542", C_TEXT="#e6edf3";
+class MiniChart{
+  constructor(canvas, type, series, yFmt){
+    this.cv=canvas; this.type=type; this.yFmt=yFmt||(v=>Math.round(v));
+    this.data={labels:[],datasets:series.map(s=>({...s,data:[]}))};
+    new ResizeObserver(()=>this.update()).observe(canvas.parentElement);
+  }
+  prep(){
+    const dpr=window.devicePixelRatio||1, r=this.cv.parentElement.getBoundingClientRect();
+    this.w=r.width; this.h=r.height; this.cv.width=r.width*dpr; this.cv.height=r.height*dpr;
+    this.cv.style.width=r.width+"px"; this.cv.style.height=r.height+"px";
+    const g=this.cv.getContext("2d"); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,r.width,r.height);
+    g.font="12px system-ui,sans-serif"; return g;
+  }
+  update(){ if(!this.cv.offsetParent) return; const g=this.prep();
+    this.type==="doughnut" ? this.donut(g) : this.axes(g); }
+  axes(g){
+    const ds=this.data.datasets, L=this.data.labels, n=L.length;
+    // legend
+    let lx=8; if(ds.length>1) ds.forEach(d=>{g.fillStyle=d.color;g.fillRect(lx,6,10,10);g.fillStyle=C_MUTED;g.fillText(d.label,lx+14,15);lx+=g.measureText(d.label).width+30;});
+    const top=ds.length>1?28:10, left=78, right=10, bottom=24, W=this.w-left-right, H=this.h-top-bottom;
+    const max=Math.max(1,...ds.flatMap(d=>d.data))*1.15;
+    g.textAlign="right"; g.strokeStyle=C_GRID; g.lineWidth=1;
+    for(let i=0;i<=4;i++){const y=top+H-H*i/4; g.beginPath();g.moveTo(left,y);g.lineTo(left+W,y);g.stroke();
+      g.fillStyle=C_MUTED; g.fillText(this.yFmt(max*i/4),left-8,y+4);}
+    if(!n){g.textAlign="center";g.fillText("Waiting for data…",left+W/2,top+H/2);return;}
+    g.textAlign="center"; const step=Math.max(1,Math.ceil(n/Math.max(1,Math.floor(W/80))));
+    const X=i=>left+(this.type==="bar"? (i+.5)*W/n : (n===1?W/2:i*W/(n-1)));
+    for(let i=0;i<n;i+=step){const x=X(i),tw=g.measureText(L[i]).width/2; g.fillText(L[i],Math.min(Math.max(x,left+tw),left+W-tw),this.h-6);}
+    const Y=v=>top+H-H*v/max;
+    ds.forEach(d=>{
+      if(this.type==="bar"){ g.fillStyle=d.color; const bw=Math.max(1,W/n*0.7);
+        d.data.forEach((v,i)=>g.fillRect(X(i)-bw/2,Y(v),bw,top+H-Y(v))); return; }
+      g.beginPath(); d.data.forEach((v,i)=>i?g.lineTo(X(i),Y(v)):g.moveTo(X(i),Y(v)));
+      g.strokeStyle=d.color; g.lineWidth=2; g.stroke();
+      g.lineTo(X(d.data.length-1),top+H); g.lineTo(X(0),top+H); g.closePath();
+      g.globalAlpha=.13; g.fillStyle=d.color; g.fill(); g.globalAlpha=1;
+    });
+  }
+  donut(g){
+    const vals=this.data.datasets[0].data, L=this.data.labels, tot=vals.reduce((a,b)=>a+b,0);
+    const cx=Math.min(this.w*0.28,this.h/2)+4, cy=this.h/2, R=Math.min(cx-6,this.h/2-6), r=R*0.6;
+    if(!tot){g.fillStyle=C_MUTED;g.textAlign="center";g.fillText("No packets yet",this.w/2,cy);return;}
+    let a=-Math.PI/2;
+    vals.forEach((v,i)=>{const e=a+2*Math.PI*v/tot; g.beginPath();g.arc(cx,cy,R,a,e);g.arc(cx,cy,r,e,a,true);g.closePath();
+      g.fillStyle=PALETTE[i%PALETTE.length];g.fill(); a=e;});
+    g.fillStyle=C_TEXT; g.textAlign="center"; g.font="600 16px system-ui"; g.fillText(tot.toLocaleString(),cx,cy+2);
+    g.font="11px system-ui"; g.fillStyle=C_MUTED; g.fillText("packets",cx,cy+17);
+    g.textAlign="left"; g.font="12px system-ui"; const lx=cx+R+24;
+    L.forEach((l,i)=>{const y=cy-(L.length*20)/2+i*20+12; g.fillStyle=PALETTE[i%PALETTE.length]; g.fillRect(lx,y-9,10,10);
+      g.fillStyle=C_TEXT; g.fillText(l,lx+16,y); g.fillStyle=C_MUTED;
+      g.textAlign="right"; g.fillText((vals[i]/tot*100).toFixed(1)+"%",this.w-6,y); g.textAlign="left";});
+  }
+}
+const bwChart = new MiniChart($("#bwChart"),"line",
+  [{label:"Download",color:"#3fb6a8"},{label:"Upload",color:"#e3a13b"}], v=>fmtRate(v));
+const protoChart = new MiniChart($("#protoChart"),"doughnut",[{label:"Protocols"}]);
+const ppsChart = new MiniChart($("#ppsChart"),"bar",[{label:"Packets/s",color:"#3fb6a8"}]);
+
+// ---------- overview ----------
+let selIface = null, ifaceMeta = [];
+async function loadInterfaces(){
+  ifaceMeta = await api("/api/interfaces");
+  const sel = $("#capIface"); const cur = sel.value;
+  sel.innerHTML = '<option value="">All interfaces</option>' + ifaceMeta.map(i=>`<option ${i.name===cur?"selected":""}>${esc(i.name)}</option>`).join("");
+  if(!selIface){ const first = ifaceMeta.find(i=>i.up && i.name!=="lo") || ifaceMeta[0]; selIface = first && first.name; }
+  $("#ifButtons").innerHTML = ifaceMeta.map(i=>`<button class="${i.name===selIface?"active":""}" data-if="${esc(i.name)}">${esc(i.name)}</button>`).join("");
+  document.querySelectorAll("#ifButtons button").forEach(b=>b.onclick=()=>{selIface=b.dataset.if;loadInterfaces();refreshBandwidth()});
+}
+async function refreshBandwidth(){
+  const d = await api("/api/bandwidth");
+  let rx=0,tx=0,trx=0,ttx=0;
+  const rows = ifaceMeta.map(i=>{
+    const c = d.current[i.name] || {};
+    if(i.name!=="lo"){rx+=c.rx_rate||0;tx+=c.tx_rate||0;trx+=c.bytes_recv||0;ttx+=c.bytes_sent||0}
+    return `<tr><td><b>${esc(i.name)}</b></td>
+      <td>${i.up?'<span class="up">● up</span>':'<span class="down">● down</span>'}${i.speed?` <span class="meta">${i.speed} Mb/s</span>`:""}</td>
+      <td class="mono">${esc(i.ipv4.join(", ")||"—")}</td><td class="mono">${esc(i.mac||"—")}</td>
+      <td class="mono">${fmtRate(c.rx_rate||0)}</td><td class="mono">${fmtRate(c.tx_rate||0)}</td>
+      <td class="mono">${fmtBytes(c.bytes_recv||0)}</td><td class="mono">${fmtBytes(c.bytes_sent||0)}</td>
+      <td class="mono">${(c.errin||0)+(c.errout||0)}</td><td class="mono">${(c.dropin||0)+(c.dropout||0)}</td></tr>`;
+  });
+  $("#ifTable tbody").innerHTML = rows.join("");
+  $("#totals").innerHTML = `
+    <div class="card"><h3>Download now</h3><div class="stat">${fmtRate(rx)}</div></div>
+    <div class="card"><h3>Upload now</h3><div class="stat">${fmtRate(tx)}</div></div>
+    <div class="card"><h3>Received (since boot)</h3><div class="stat">${fmtBytes(trx)}</div></div>
+    <div class="card"><h3>Sent (since boot)</h3><div class="stat">${fmtBytes(ttx)}</div></div>`;
+  const h = d.history[selIface] || [];
+  bwChart.data.labels = h.map(p=>new Date(p.t*1000).toLocaleTimeString([],{hour12:false}));
+  bwChart.data.datasets[0].data = h.map(p=>p.rx);
+  bwChart.data.datasets[1].data = h.map(p=>p.tx);
+  bwChart.update();
+}
+
+// ---------- capture ----------
+function talkerList(list){
+  if(!list.length) return '<div class="meta">No data yet</div>';
+  const max = list[0][1] || 1;
+  return list.map(([ip,b])=>`<div style="margin-bottom:8px"><div class="row" style="justify-content:space-between">
+    <span class="mono">${esc(ip)}</span><span class="mono meta">${fmtBytes(b)}</span></div>
+    <div class="bar"><i style="width:${(b/max*100).toFixed(1)}%"></i></div></div>`).join("");
+}
+function showMsg(el, text){ el.textContent = text; el.style.display = text ? "block" : "none"; }
+async function refreshCapture(){
+  const d = await api("/api/capture/status");
+  if(!d.scapy_ok) showMsg($("#capMsg"), "Scapy is not installed: "+d.scapy_err+"  →  pip install scapy");
+  $("#capDot").classList.toggle("on", d.running);
+  $("#cPackets").textContent = d.total_packets.toLocaleString();
+  $("#cBytes").textContent = fmtBytes(d.total_bytes);
+  const last = d.pps[d.pps.length-1] || {pps:0,bps:0};
+  $("#cPps").textContent = d.running ? last.pps : 0;
+  $("#cBps").textContent = fmtRate(d.running ? last.bps : 0);
+  protoChart.data.labels = d.protocols.slice(0,10).map(p=>p[0]);
+  protoChart.data.datasets[0].data = d.protocols.slice(0,10).map(p=>p[1]);
+  protoChart.update();
+  const pw = d.pps.slice(-60);
+  ppsChart.data.labels = pw.map(p=>new Date(p.t*1000).toLocaleTimeString([],{hour12:false}));
+  ppsChart.data.datasets[0].data = pw.map(p=>p.pps);
+  ppsChart.update();
+  $("#topSrc").innerHTML = talkerList(d.top_src);
+  $("#topDst").innerHTML = talkerList(d.top_dst);
+  $("#topPorts").innerHTML = d.top_ports.length ? d.top_ports.map(([p,n,c])=>`<span class="pill">${p}${n?" · "+esc(n):""} <span class="meta">${c}</span></span>`).join("") : '<div class="meta">No data yet</div>';
+  $("#pktTable tbody").innerHTML = d.recent.map(p=>`<tr><td class="mono">${p.time}</td><td class="mono">${esc(p.src)}</td>
+    <td class="mono">${esc(p.dst)}</td><td><span class="pill">${esc(p.proto)}</span></td><td class="mono">${p.len}</td>
+    <td class="mono">${esc(p.info)}</td></tr>`).join("");
+}
+$("#capStart").onclick = async () => {
+  const r = await api("/api/capture/start", {iface:$("#capIface").value, filter:$("#capFilter").value});
+  showMsg($("#capMsg"), r.ok ? "" : r.error); refreshCapture();
+};
+$("#capStop").onclick = async () => { await api("/api/capture/stop", {}); refreshCapture(); };
+$("#capReset").onclick = async () => { await api("/api/capture/reset", {}); refreshCapture(); };
+
+// ---------- connections ----------
+let connData = [];
+function renderConns(){
+  const q = $("#connSearch").value.toLowerCase();
+  const rows = connData.filter(c => !q || Object.values(c).join(" ").toLowerCase().includes(q));
+  $("#connCount").textContent = rows.length + " connections";
+  $("#connTable tbody").innerHTML = rows.map(c=>`<tr><td><span class="pill">${c.proto}${c.family==="IPv6"?"6":""}</span></td>
+    <td class="mono">${esc(c.laddr)}</td><td class="mono">${esc(c.raddr||"—")}</td>
+    <td>${c.status==="ESTABLISHED"?'<span class="up">ESTABLISHED</span>':esc(c.status)}</td>
+    <td class="mono">${c.pid}</td><td>${esc(c.process)}</td></tr>`).join("");
+}
+async function refreshConns(){
+  const d = await api("/api/connections?kind="+$("#connKind").value);
+  connData = d.connections;
+  showMsg($("#connMsg"), d.denied ? "Run with sudo to see all connections and their processes." : "");
+  renderConns();
+}
+$("#connSearch").oninput = renderConns;
+$("#connKind").onchange = refreshConns;
+
+// ---------- tools ----------
+async function runTool(url, inp, out, btn){
+  const host = $(inp).value.trim(); if(!host) return;
+  $(out).textContent = "Running…"; $(btn).disabled = true;
+  try { const r = await api(url, {host}); $(out).textContent = r.output; }
+  catch(e){ $(out).textContent = "Error: "+e; }
+  $(btn).disabled = false;
+}
+$("#pingBtn").onclick = () => runTool("/api/tools/ping","#pingHost","#pingOut","#pingBtn");
+$("#dnsBtn").onclick  = () => runTool("/api/tools/dns","#dnsHost","#dnsOut","#dnsBtn");
+$("#pingHost").onkeydown = e => e.key==="Enter" && $("#pingBtn").click();
+$("#dnsHost").onkeydown  = e => e.key==="Enter" && $("#dnsBtn").click();
+
+// ---------- system + loop ----------
+async function refreshSystem(){
+  const s = await api("/api/system");
+  $("#host").textContent = "🖥 " + s.hostname;
+  $("#uptime").textContent = "up " + fmtDur(s.uptime);
+  $("#cpu").textContent = "CPU " + s.cpu.toFixed(0) + "%";
+  $("#mem").textContent = "RAM " + s.mem.toFixed(0) + "%";
+}
+let n = 0;
+async function tick(){
+  try{
+    if(activeTab==="overview") await refreshBandwidth();
+    if(activeTab==="capture") await refreshCapture();
+    if(activeTab==="connections" && (n%3===0 || !connData.length)) await refreshConns();
+    if(n%5===0) await refreshSystem();
+    if(n%15===0) await loadInterfaces();
+  }catch(e){ console.error(e); }
+}
+(async()=>{ await loadInterfaces(); await refreshSystem(); tick(); setInterval(()=>{n++;tick()},1000); })();
+</script>
+</body>
+</html>
+'''
 
 
 # --------------------------------------------------------------------------- #
