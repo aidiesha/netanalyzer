@@ -6,6 +6,8 @@ Open it in any browser and you get:
 - **Overview** – live download/upload speed per interface, 2-minute history chart, totals, errors and drops
 - **Packet Capture** – live packet list, protocol breakdown (HTTPS, DNS, SSH, ARP, ICMP…), packets/sec,
   top source & destination IPs, top ports, and BPF filters such as `tcp port 443` or `host 192.168.1.10`
+- **Discovery** – scan your local subnet for live hosts, showing each host's IP, hostname, MAC address,
+  and open ports from a common-port scan. Auto-detects your subnet; you can also type a range like `192.168.1.0/24`
 - **Connections** – every open TCP/UDP connection and listening port with its process name, searchable
 - **Tools** – ping and DNS lookup
 
@@ -15,8 +17,7 @@ It works fully offline – no CDN or internet access needed.
 
 ```
 netanalyzer/
-├── app.py              # backend (Flask server, bandwidth monitor, packet sniffer)
-├── templates/index.html# web dashboard
+├── app.py              # the whole app: web server, dashboard, bandwidth monitor, packet sniffer
 ├── requirements.txt
 ├── install.sh          # one-time setup
 └── run.sh              # start the server
@@ -110,6 +111,23 @@ sudo systemctl status netanalyzer
 | Connections tab shows a warning / no process names | Run with `sudo` |
 | "ping not found" | `sudo apt install iputils-ping` |
 | Port 5000 in use | `sudo ./run.sh --port 8080` |
+
+## Discovery / scanning
+
+The Discovery tab finds other devices on your local network:
+
+1. It uses an **ARP scan** (layer 2) to find live hosts on your subnet — fast and reliable on a LAN.
+   Hosts that don't answer ARP are also probed on a few common TCP ports as a fallback.
+2. For each host found it does a reverse-DNS lookup for the hostname and a light TCP scan of ~23 common ports.
+
+Notes and limits:
+- Run with `sudo` for the ARP scan (raw sockets). Without root it still works using the TCP fallback,
+  but discovery is slower and may miss hosts that block those ports.
+- IPv4 only, and the range is capped at a `/20` (4096 addresses) so a scan can't run away.
+- The port scan is a plain TCP connect scan of common ports, not a full `nmap`-style scan.
+
+⚠️ **Only scan networks you own or have explicit permission to scan.** Port-scanning other
+people's networks may be against the law where you live and against your provider's terms.
 
 ## Notes
 

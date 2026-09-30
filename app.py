@@ -13,11 +13,13 @@ Packet capture needs root or CAP_NET_RAW (see README.md).
 """
 import argparse
 import collections
+import ipaddress
 import re
 import socket
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import psutil
@@ -230,8 +232,212 @@ class PacketCapture:
             }
 
 
+# --------------------------------------------------------------------------- #
+# Network / host scanner  (LAN host discovery + common-port scan)
+# --------------------------------------------------------------------------- #
+COMMON_PORTS = [21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 993, 995,
+                1723, 3306, 3389, 5432, 5900, 6379, 8080, 8443]
+
+
+class NetworkScanner:
+    """Discovers live hosts on a subnet, then scans common TCP ports on each."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.thread = None
+        self.stop_flag = threading.Event()
+        self.reset()
+
+    def reset(self):
+        self.state = "idle"          # idle | running | done | error
+        self.cidr = ""
+        self.message = ""
+        self.started_at = None
+        self.done_at = None
+        self.total = 0
+        self.scanned = 0
+        self.hosts = {}              # ip -> {ip, mac, hostname, ports:[...], responded}
+
+    @property
+    def running(self):
+        return self.state == "running"
+
+    def start(self, cidr, do_ports=True):
+        if self.running:
+            raise RuntimeError("A scan is already running.")
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid network: {exc}")
+        if net.version != 4:
+            raise RuntimeError("Only IPv4 ranges are supported.")
+        if net.num_addresses > 4096:
+            raise RuntimeError("Range too large (max /20, 4096 addresses). Narrow it down.")
+
+        with self.lock:
+            self.reset()
+            self.state = "running"
+            self.cidr = str(net)
+            self.started_at = time.time()
+            hosts = list(net.hosts()) if net.num_addresses > 2 else list(net)
+            self.total = len(hosts)
+        self.stop_flag.clear()
+        self.thread = threading.Thread(target=self._run, args=(hosts, do_ports), daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_flag.set()
+
+    # -- discovery ----------------------------------------------------------- #
+    def _arp_table(self):
+        """Read the kernel ARP cache -> {ip: mac} (fills in MACs for free)."""
+        table = {}
+        try:
+            with open("/proc/net/arp") as fh:
+                next(fh, None)
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[3] != "00:00:00:00:00:00":
+                        table[parts[0]] = parts[3]
+        except OSError:
+            pass
+        return table
+
+    def _arp_scan(self, hosts):
+        """Fast layer-2 discovery with scapy (LAN only). Returns {ip: mac}."""
+        if not SCAPY_OK:
+            return {}
+        found = {}
+        try:
+            from scapy.all import Ether, srp
+            for i in range(0, len(hosts), 256):
+                if self.stop_flag.is_set():
+                    break
+                chunk = [str(h) for h in hosts[i:i + 256]]
+                pkt = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=chunk)
+                ans, _ = srp(pkt, timeout=2, verbose=0)
+                for _s, r in ans:
+                    found[r.psrc] = r.hwsrc
+        except Exception:
+            pass
+        return found
+
+    def _tcp_alive(self, ip):
+        """Fallback probe: a host is 'up' if any common port answers or refuses."""
+        for port in (80, 443, 22, 445, 3389):
+            if self.stop_flag.is_set():
+                return False
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.4)
+                    if s.connect_ex((ip, port)) == 0:
+                        return True
+            except OSError:
+                pass
+        return False
+
+    def _scan_ports(self, ip):
+        open_ports = []
+        for port in COMMON_PORTS:
+            if self.stop_flag.is_set():
+                break
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.5)
+                    if s.connect_ex((ip, port)) == 0:
+                        open_ports.append({"port": port, "service": WELL_KNOWN_PORTS.get(port, "")})
+            except OSError:
+                pass
+        return open_ports
+
+    def _run(self, hosts, do_ports):
+        try:
+            arp_pre = self._arp_table()
+            arp_scan = self._arp_scan(hosts)
+
+            def probe(host):
+                ip = str(host)
+                if self.stop_flag.is_set():
+                    return
+                mac = arp_scan.get(ip) or arp_pre.get(ip, "")
+                alive = bool(mac) or self._tcp_alive(ip)
+                with self.lock:
+                    self.scanned += 1
+                    if not alive:
+                        return
+                    hostname = ""
+                    try:
+                        hostname = socket.gethostbyaddr(ip)[0]
+                    except OSError:
+                        pass
+                    self.hosts[ip] = {"ip": ip, "mac": mac, "hostname": hostname,
+                                      "ports": [], "scanning_ports": do_ports}
+
+            with ThreadPoolExecutor(max_workers=100) as pool:
+                pool.map(probe, hosts)
+
+            if do_ports and not self.stop_flag.is_set():
+                with self.lock:
+                    targets = list(self.hosts.keys())
+
+                def portscan(ip):
+                    if self.stop_flag.is_set():
+                        return
+                    ports = self._scan_ports(ip)
+                    with self.lock:
+                        if ip in self.hosts:
+                            self.hosts[ip]["ports"] = ports
+                            self.hosts[ip]["scanning_ports"] = False
+
+                with ThreadPoolExecutor(max_workers=50) as pool:
+                    pool.map(portscan, targets)
+
+            with self.lock:
+                self.state = "done"
+                self.done_at = time.time()
+                self.message = "Scan cancelled." if self.stop_flag.is_set() else ""
+        except Exception as exc:
+            with self.lock:
+                self.state = "error"
+                self.message = str(exc)
+                self.done_at = time.time()
+
+    def snapshot(self):
+        with self.lock:
+            hosts = sorted(self.hosts.values(),
+                           key=lambda h: tuple(int(x) for x in h["ip"].split(".")))
+            return {
+                "state": self.state,
+                "cidr": self.cidr,
+                "message": self.message,
+                "total": self.total,
+                "scanned": self.scanned,
+                "elapsed": (self.done_at or time.time()) - self.started_at if self.started_at else 0,
+                "host_count": len(hosts),
+                "hosts": hosts,
+            }
+
+
+def local_ipv4_networks():
+    """Guess the local subnets from interface addresses/netmasks."""
+    nets = []
+    for name, addr_list in psutil.net_if_addrs().items():
+        if name == "lo":
+            continue
+        for a in addr_list:
+            if a.family == socket.AF_INET and a.netmask:
+                try:
+                    net = ipaddress.ip_network(f"{a.address}/{a.netmask}", strict=False)
+                    if net.num_addresses <= 4096 and not net.is_loopback:
+                        nets.append({"cidr": str(net), "iface": name, "address": a.address})
+                except ValueError:
+                    pass
+    return nets
+
+
 bandwidth = BandwidthMonitor()
 capture = PacketCapture()
+scanner = NetworkScanner()
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -351,6 +557,32 @@ def api_capture_reset():
     return jsonify({"ok": True})
 
 
+@app.route("/api/scan/networks")
+def api_scan_networks():
+    return jsonify(local_ipv4_networks())
+
+
+@app.route("/api/scan/status")
+def api_scan_status():
+    return jsonify(scanner.snapshot())
+
+
+@app.route("/api/scan/start", methods=["POST"])
+def api_scan_start():
+    data = request.get_json(silent=True) or {}
+    try:
+        scanner.start((data.get("cidr") or "").strip(), bool(data.get("ports", True)))
+        return jsonify({"ok": True})
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.route("/api/scan/stop", methods=["POST"])
+def api_scan_stop():
+    scanner.stop()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/tools/ping", methods=["POST"])
 def api_ping():
     host = ((request.get_json(silent=True) or {}).get("host") or "").strip()
@@ -457,6 +689,7 @@ INDEX_HTML = r'''<!doctype html>
   <nav>
     <button class="active" data-tab="overview">Overview</button>
     <button data-tab="capture">Packet Capture</button>
+    <button data-tab="discovery">Discovery</button>
     <button data-tab="connections">Connections</button>
     <button data-tab="tools">Tools</button>
   </nav>
@@ -512,6 +745,27 @@ INDEX_HTML = r'''<!doctype html>
       <h3>Live packets</h3>
       <div class="scroll"><table id="pktTable"><thead><tr>
         <th>Time</th><th>Source</th><th>Destination</th><th>Protocol</th><th>Length</th><th>Info</th></tr></thead><tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- DISCOVERY -->
+  <section class="tab" id="discovery">
+    <div class="msg" id="scanMsg"></div>
+    <div class="card">
+      <div class="row">
+        <select id="scanNet"><option value="">Detecting subnets…</option></select>
+        <input id="scanCidr" placeholder="or type a range, e.g. 192.168.1.0/24" style="flex:1">
+        <label class="row" style="gap:6px"><input type="checkbox" id="scanPorts" checked style="min-width:0"> scan ports</label>
+        <button class="btn" id="scanStart">Scan</button>
+        <button class="btn stop" id="scanStop">Stop</button>
+      </div>
+      <div style="margin-top:10px" id="scanProgress"></div>
+      <div class="bar" style="margin-top:6px"><i id="scanBar" style="width:0%"></i></div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h3>Discovered hosts <span id="scanCount" class="meta"></span></h3>
+      <div class="scroll" style="max-height:620px"><table id="scanTable"><thead><tr>
+        <th>IP address</th><th>Hostname</th><th>MAC</th><th>Open ports</th></tr></thead><tbody></tbody></table></div>
     </div>
   </section>
 
@@ -698,6 +952,45 @@ $("#capStart").onclick = async () => {
 $("#capStop").onclick = async () => { await api("/api/capture/stop", {}); refreshCapture(); };
 $("#capReset").onclick = async () => { await api("/api/capture/reset", {}); refreshCapture(); };
 
+// ---------- discovery ----------
+let scanNetsLoaded = false;
+async function loadScanNets(){
+  const nets = await api("/api/scan/networks");
+  const sel = $("#scanNet");
+  sel.innerHTML = (nets.length ? nets.map(n=>`<option value="${esc(n.cidr)}">${esc(n.cidr)} (${esc(n.iface)})</option>`).join("")
+                 : '<option value="">No local subnet found — type one</option>');
+  if(nets.length && !$("#scanCidr").value) $("#scanCidr").value = nets[0].cidr;
+  sel.onchange = () => { $("#scanCidr").value = sel.value; };
+  scanNetsLoaded = true;
+}
+function portPills(h){
+  if(h.scanning_ports) return '<span class="meta">scanning…</span>';
+  if(!h.ports || !h.ports.length) return '<span class="meta">—</span>';
+  return h.ports.map(p=>`<span class="pill">${p.port}${p.service?" · "+esc(p.service):""}</span>`).join(" ");
+}
+async function refreshScan(){
+  const d = await api("/api/scan/status");
+  const pct = d.total ? Math.round(d.scanned/d.total*100) : 0;
+  $("#scanBar").style.width = pct + "%";
+  const label = {idle:"Ready.",running:"Scanning",done:"Scan complete",error:"Error"}[d.state] || "";
+  $("#scanProgress").innerHTML = d.state==="idle" ? '<span class="meta">Pick a subnet and press Scan.</span>' :
+    `<b>${label}</b> ${d.cidr?esc(d.cidr):""} — ${d.scanned}/${d.total} addresses, `+
+    `${d.host_count} host${d.host_count===1?"":"s"} found · ${d.elapsed.toFixed(1)}s`;
+  showMsg($("#scanMsg"), d.state==="error" ? d.message : (d.message||""));
+  $("#scanCount").textContent = d.host_count ? "("+d.host_count+")" : "";
+  $("#scanTable tbody").innerHTML = d.hosts.map(h=>`<tr>
+    <td class="mono"><b>${esc(h.ip)}</b></td><td>${esc(h.hostname||"—")}</td>
+    <td class="mono">${esc(h.mac||"—")}</td><td>${portPills(h)}</td></tr>`).join("")
+    || (d.state==="running" ? '<tr><td colspan="4" class="meta">Searching…</td></tr>'
+                            : '<tr><td colspan="4" class="meta">No hosts yet.</td></tr>');
+}
+$("#scanStart").onclick = async () => {
+  const r = await api("/api/scan/start", {cidr:$("#scanCidr").value, ports:$("#scanPorts").checked});
+  showMsg($("#scanMsg"), r.ok ? "" : r.error); refreshScan();
+};
+$("#scanStop").onclick = async () => { await api("/api/scan/stop", {}); };
+$("#scanCidr").onkeydown = e => e.key==="Enter" && $("#scanStart").click();
+
 // ---------- connections ----------
 let connData = [];
 function renderConns(){
@@ -744,6 +1037,7 @@ async function tick(){
   try{
     if(activeTab==="overview") await refreshBandwidth();
     if(activeTab==="capture") await refreshCapture();
+    if(activeTab==="discovery"){ if(!scanNetsLoaded) await loadScanNets(); await refreshScan(); }
     if(activeTab==="connections" && (n%3===0 || !connData.length)) await refreshConns();
     if(n%5===0) await refreshSystem();
     if(n%15===0) await loadInterfaces();
